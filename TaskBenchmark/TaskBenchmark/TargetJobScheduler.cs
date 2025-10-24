@@ -14,6 +14,7 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
     private readonly CancellationTokenSource _source = new();
     private readonly CancellationToken _token;
     private readonly TaskFactory _choreTaskFactory;
+    private readonly CancellationTokenSource _linkedSource;
     private const string ThreadNamePrefix = nameof(TargetJobScheduler);
 
     public TargetJobScheduler(int maxConcurrency, ThreadPriority priority,TaskFactory? choreTaskFactory,CancellationToken token)
@@ -22,11 +23,7 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
 
         if (choreTaskFactory == null)
         {
-            _choreTaskFactory = new TaskFactory(
-                CancellationToken.None,
-                TaskCreationOptions.None,
-                TaskContinuationOptions.None,
-                this);
+            _choreTaskFactory = new TaskFactory(TaskScheduler.Default);
         }
         else
         {
@@ -44,7 +41,8 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
         _channel = Channel.CreateBounded<Task>(options);
         _writer = _channel.Writer;
         _reader = _channel.Reader;
-        _token = CancellationTokenSource.CreateLinkedTokenSource(token, _source.Token).Token;
+        _linkedSource = CancellationTokenSource.CreateLinkedTokenSource(token, _source.Token);
+        _token = _linkedSource.Token;
 
         _workers = new Thread[maxConcurrency];
         for (int i = 0; i < maxConcurrency; i++)
@@ -53,7 +51,7 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
             {
                 Name = $"{ThreadNamePrefix}-unknown",
                 Priority = priority,
-                IsBackground = true,
+                IsBackground = true
             };
             _workers[i].Start();
         }
@@ -66,8 +64,15 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
 
         if (!_writer.TryWrite(task))
         {
-            // 如果队列满了，异步写入
-            _choreTaskFactory.StartNew(async () => await _writer.WriteAsync(task,_token),_token);
+            SpinWait wait = new();
+
+            var writeAsync = _writer.WriteAsync(task, _token);
+            var awaiter = writeAsync.GetAwaiter();
+
+            while (!awaiter.IsCompleted)
+            {
+                wait.SpinOnce();
+            }
         }
     }
 
@@ -95,22 +100,21 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
     {
         Thread.CurrentThread.Name = $"{ThreadNamePrefix}-{Environment.CurrentManagedThreadId}";
 
+        SpinWait wait = new();
+
         while (!_token.IsCancellationRequested)
         {
             try
             {
-                var read = _reader.ReadAsync(_token).AsTask();
-                read.ConfigureAwait(false);
-                read.Wait(_token);
+                 var task = _reader.ReadAsync(_token);
+                 var awaiter = task.GetAwaiter();
 
-                if (read.IsCompletedSuccessfully)
+                while (!awaiter.IsCompleted)
                 {
-                    TryExecuteTask(read.Result);
+                    wait.SpinOnce();
                 }
-                else if (read.Exception != null)
-                {
-                    throw read.Exception;
-                }
+
+                TryExecuteTask(awaiter.GetResult());
             }
             catch (OperationCanceledException) when (_token.IsCancellationRequested)
             {
@@ -134,5 +138,6 @@ public sealed class TargetJobScheduler : TaskScheduler, IDisposable
         }
 
         _source.Dispose();
+        _linkedSource.Dispose();
     }
 }
